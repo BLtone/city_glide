@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>ASCII 城市飞行</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000;
+    touch-action:none;-webkit-user-select:none;user-select:none;
+    -webkit-tap-highlight-color:transparent;overscroll-behavior:none;}
+  canvas{display:block;position:absolute;top:0;left:0;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+'use strict';
+
+/* ============================== 字符集 ==============================
+   0 ' '   1 '.'   2 ':'   3 '-'   4 '='   5 '+'   6 '*'
+   7 '%'   8 '#'   9 '@'  10 '_'  11 '|'  12 'o'
+   —— 地面 '.' 网格 '+'    树干 '|' 树冠 '*'
+   —— 墙体 '#' 窗户 'o'    棱线 '|' 边线 '=' 楼顶 '-'
+==================================================================== */
+var CHARS = " .:-=+*%#@_|o";
+var NCH   = CHARS.length;
+
+var CH_GROUND = 1;   // '.'
+var CH_ROAD   = 5;   // '+'
+var CH_ROOF   = 3;   // '-'
+var CH_HEDGE  = 4;   // '='
+var CH_WALL   = 8;   // '#'
+var CH_VEDGE  = 11;  // '|'
+var CH_WINDOW = 12;  // 'o'
+var CH_TRUNK  = 11;  // '|'
+var CH_LEAF   = 6;   // '*'
+
+/* ============================== 调色板 ============================== */
+var PALETTE = [];
+var PALMAP  = {};
+function regPal(hex){
+  var i = PALMAP[hex];
+  if (i === undefined){
+    i = PALETTE.length;
+    PALMAP[hex] = i;
+    PALETTE.push(hex);
+  }
+  return i;
+}
+function makeIdx(hexArr){
+  var out = new Array(hexArr.length);
+  for (var i=0;i<hexArr.length;i++) out[i] = regPal(hexArr[i]);
+  return out;
+}
+
+/* 地面：深灰（近亮远暗） */
+var GROUND_HEX = ['#9c9c9c','#808080','#666666','#4e4e4e','#3a3a3a','#2a2a2a',
+                  '#1c1c1c','#121212','#090909','#040404'];
+/* 路面网格：更亮的灰 */
+var ROAD_HEX   = ['#e0e0e0','#c0c0c0','#9c9c9c','#7a7a7a','#5c5c5c','#424242',
+                  '#2e2e2e','#1e1e1e','#101010','#060606'];
+/* 楼宇：青蓝 */
+var BUILD_HEX  = ['#d8ffff','#9ef4ff','#70dcfc','#4cc0e8','#30a0cc','#2080a8',
+                  '#146488','#0c4c68','#06344a','#021c2c'];
+/* 树木：绿色 */
+var TREE_HEX   = ['#d8ffc8','#a8f098','#7cd474','#58b858','#409440','#2e742e',
+                  '#205820','#143e14','#0a2a0a','#041404'];
+
+var GROUND_IDX = makeIdx(GROUND_HEX);
+var ROAD_IDX   = makeIdx(ROAD_HEX);
+var BUILD_IDX  = makeIdx(BUILD_HEX);
+var TREE_IDX   = makeIdx(TREE_HEX);
+
+var FOG    = 640;
+var BGRID  = 110;
+var GGRID  = 30;
+var TGRID  = 36;
+
+/* 窗户图案（世界单位） */
+var WIN_P  = 10.0;
+var WIN_T  = 4.2;
+
+/* ============================== 画布 ============================== */
+var cvs = document.getElementById('c');
+var ctx = cvs.getContext('2d', {alpha:false});
+
+var W=0,H=0,SCALE=1;
+var cols=0,rows=0,cellW=0,cellH=0;
+var focalRows=1,focalCols=1,halfCols=0,halfRows=0;
+var depthBuf=null,charBuf=null,colBuf=null;
+var atlas=null;
+
+/* ============================== 相机 ============================== */
+var cam = {x:0,y:190,z:120,yaw:0,pitch:0,roll:0,throttle:0.5};
+var speedNow = 60;
+
+var FX=0,FY=0,FZ=-1, RX=1,RY=0,RZ=0, UX=0,UY=1,UZ=0;
+var pcol=0,prow=0,pdepth=0;
+
+/* ============================== 工具 ============================== */
+function clamp(v,a,b){return v<a?a:(v>b?b:v);}
+
+function hash2(x,y){
+  var h = Math.imul(x|0, 0x27d4eb2d) ^ Math.imul(y|0, 0x165667b1);
+  h = Math.imul(h ^ (h>>>15), 0x2545f491);
+  h ^= h>>>13;
+  return (h>>>0) / 4294967296;
+}
+
+function pickIdx(arr,z){
+  var t = z/FOG;
+  if (t<0) t=0; else if (t>1) t=1;
+  var i = Math.floor(t*(arr.length-1) + 0.5);
+  if (i >= arr.length) i = arr.length-1;
+  return arr[i];
+}
+
+/* ============================== 尺寸 ============================== */
+function resize(){
+  var cssW = window.innerWidth;
+  var cssH = window.innerHeight;
+  var dpr  = Math.min(2, window.devicePixelRatio || 1);
+
+  cols = clamp(Math.round(cssW/8),  24, 80);
+  rows = clamp(Math.round(cssH/13), 16, 72);
+
+  var guard = 0;
+  while (cols*rows > 2600 && guard++ < 40){
+    cols = Math.floor(cols*0.93);
+    rows = Math.floor(rows*0.93);
+  }
+
+  W = cvs.width  = Math.max(2, Math.round(cssW*dpr));
+  H = cvs.height = Math.max(2, Math.round(cssH*dpr));
+  cvs.style.width  = cssW+'px';
+  cvs.style.height = cssH+'px';
+  SCALE = W / cssW;
+
+  cellW = W/cols;
+  cellH = H/rows;
+
+  var fov = 76*Math.PI/180;
+  focalRows = (rows/2)/Math.tan(fov/2);
+  focalCols = focalRows * (cellH/cellW);
+  halfCols  = cols/2;
+  halfRows  = rows/2;
+
+  depthBuf = new Float32Array(cols*rows);
+  charBuf  = new Uint8Array(cols*rows);
+  colBuf   = new Uint8Array(cols*rows);
+
+  buildAtlas();
+}
+
+/* ============================== 字符图集（每种颜色一张） ============================== */
+function buildAtlas(){
+  var cw  = Math.max(4, Math.ceil(cellW)+1);
+  var chh = Math.max(6, Math.ceil(cellH)+1);
+  var fs  = Math.max(6, Math.floor(Math.min(cellH*0.90, cellW/0.60)));
+
+  var list = [];
+  for (var ci=0; ci<PALETTE.length; ci++){
+    var cv = document.createElement('canvas');
+    cv.width  = cw*NCH;
+    cv.height = chh;
+    var g = cv.getContext('2d');
+    g.font = fs+'px ui-monospace,Menlo,Consolas,"Courier New",monospace';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillStyle = PALETTE[ci];
+    for (var i=0;i<NCH;i++){
+      g.fillText(CHARS[i], i*cw + cw/2, chh/2 + 0.5);
+    }
+    list.push(cv);
+  }
+  atlas = {list:list, cw:cw, chh:chh};
+}
+
+/* ============================== 相机基向量 ============================== */
+function updateBasis(){
+  var cyw = Math.cos(cam.yaw), syw = Math.sin(cam.yaw);
+  var cp  = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+
+  var fx =  syw*cp, fy = sp, fz = -cyw*cp;
+  var rx =  cyw,    ry = 0,  rz =  syw;
+
+  var ux = ry*fz - rz*fy;
+  var uy = rz*fx - rx*fz;
+  var uz = rx*fy - ry*fx;
+
+  var cr = Math.cos(cam.roll), sr = Math.sin(cam.roll);
+  var nrx = rx*cr + ux*sr, nry = ry*cr + uy*sr, nrz = rz*cr + uz*sr;
+  var nux = ux*cr - rx*sr, nuy = uy*cr - ry*sr, nuz = uz*cr - rz*sr;
+
+  FX=fx; FY=fy; FZ=fz;
+  RX=nrx; RY=nry; RZ=nrz;
+  UX=nux; UY=nuy; UZ=nuz;
+}
+
+/* ============================== 投影 ============================== */
+function project(wx,wy,wz){
+  var dx = wx-cam.x, dy = wy-cam.y, dz = wz-cam.z;
+  var cz = dx*FX + dy*FY + dz*FZ;
+  if (cz < 0.6) return false;
+  var cx = dx*RX + dy*RY + dz*RZ;
+  var cy = dx*UX + dy*UY + dz*UZ;
+  var inv = 1/cz;
+  pcol = halfCols + cx*inv*focalCols;
+  prow = halfRows - cy*inv*focalRows;
+  pdepth = cz;
+  return true;
+}
+
+/* ============================== 写入缓冲区 ============================== */
+function put(c,r,z,ch,ci){
+  if (c<0||c>=cols||r<0||r>=rows) return;
+  var i = r*cols + c;
+  if (z < depthBuf[i]){
+    depthBuf[i]=z; charBuf[i]=ch; colBuf[i]=ci;
+  }
+}
+
+/* ============================== 地面 ============================== */
+function renderGround(){
+  var r,c,cxv,cyv,dxw,dyw,dzw,t,wx,wz,cellW_w,gx,gz,dm,lw,ch,ci;
+
+  for (r=0;r<rows;r++){
+    cyv = (halfRows - r - 0.5)/focalRows;
+    for (c=0;c<cols;c++){
+      cxv = (c + 0.5 - halfCols)/focalCols;
+
+      dxw = RX*cxv + UX*cyv + FX;
+      dyw = RY*cxv + UY*cyv + FY;
+      dzw = RZ*cxv + UZ*cyv + FZ;
+
+      if (dyw > -0.03) continue;
+
+      t = -cam.y / dyw;
+      if (t <= 0 || t > FOG) continue;
+
+      wx = cam.x + dxw*t;
+      wz = cam.z + dzw*t;
+
+      cellW_w = t/focalCols;
+
+      gx = wx - Math.round(wx/GGRID)*GGRID;
+      gz = wz - Math.round(wz/GGRID)*GGRID;
+      dm = Math.abs(gx) < Math.abs(gz) ? Math.abs(gx) : Math.abs(gz);
+
+      lw = cellW_w*0.60;
+      if (lw < 1.2) lw = 1.2;
+
+      if (dm < lw){
+        ch = CH_ROAD;
+        ci = pickIdx(ROAD_IDX, t);
+      } else {
+        ch = CH_GROUND;
+        ci = pickIdx(GROUND_IDX, t);
+      }
+
+      put(c, r, t, ch, ci);
+    }
+  }
+}
+
+/* ============================== 建筑参数 ============================== */
+var _b = {x:0,z:0,w:0,d:0,h:0,ok:false};
+function getBuilding(i,j){
+  if (hash2(i,j) < 0.16){ _b.ok = false; return _b; }
+  var rx = hash2(i+917,  j-331);
+  var rz = hash2(i-401,  j+733);
+  var rw = hash2(i+55,   j+77);
+  var rd = hash2(i-13,   j+199);
+  var rh = hash2(i+331,  j-917);
+
+  _b.ok = true;
+  _b.x = i*BGRID + (rx-0.5)*24;
+  _b.z = j*BGRID + (rz-0.5)*24;
+  _b.w = 26 + rw*44;
+  _b.d = 26 + rd*44;
+  _b.h = 50 + Math.pow(rh, 2.6)*370;
+  return _b;
+}
+
+/* ============================== 墙面 ============================== */
+var _vch = new Uint8Array(160);
+var _vci = new Uint8Array(160);
+
+function drawWall(x0,z0,x1,z1,h,dist){
+  var dx = x1-x0, dz = z1-z0;
+  var len = Math.sqrt(dx*dx + dz*dz);
+  if (len < 0.01) return;
+
+  var stepH = dist/focalCols * 0.85;
+  var stepV = dist/focalRows * 0.85;
+  if (stepH < 0.6) stepH = 0.6;
+  if (stepV < 0.6) stepV = 0.6;
+
+  var nu = Math.round(len/stepH);
+  if (nu < 1) nu = 1;
+  var nuMax = cols < 64 ? cols : 64;
+  if (nu > nuMax) nu = nuMax;
+
+  var nv = Math.round(h/stepV);
+  if (nv < 1) nv = 1;
+  var nvMax = rows < 72 ? rows : 72;
+  if (nv > nvMax) nv = nvMax;
+  if (nv > 150) nv = 150;
+
+  /* 基准颜色（墙体）与窗户颜色（在色阶里更暗一档） */
+  var baseCi = pickIdx(BUILD_IDX, dist);
+  var t = dist/FOG;
+  if (t<0) t=0; else if (t>1) t=1;
+  var wi = Math.floor(t*(BUILD_IDX.length-1) + 0.5) + 2;
+  if (wi >= BUILD_IDX.length) wi = BUILD_IDX.length-1;
+  var winCi = BUILD_IDX[wi];
+
+  var v, py, mod;
+  for (v=0; v<=nv; v++){
+    if (v === 0 || v === nv){
+      _vch[v] = CH_HEDGE;
+      _vci[v] = baseCi;
+    } else {
+      py = h*v/nv;
+      mod = py - Math.floor(py/WIN_P)*WIN_P;
+      if (mod < WIN_T){
+        _vch[v] = CH_WINDOW;
+        _vci[v] = winCi;
+      } else {
+        _vch[v] = CH_WALL;
+        _vci[v] = baseCi;
+      }
+    }
+  }
+
+  var u, tt, px, pz, pu, colMod, isWinCol, isVertEdge, ch, ci, cc, rr, pyy;
+
+  for (u=0; u<=nu; u++){
+    tt = u/nu;
+    px = x0 + dx*tt;
+    pz = z0 + dz*tt;
+    pu = tt*len;
+
+    isVertEdge = (u === 0 || u === nu);
+    colMod = pu - Math.floor(pu/WIN_P)*WIN_P;
+    isWinCol = (colMod < WIN_T);
+
+    for (v=0; v<=nv; v++){
+      pyy = h*v/nv;
+      if (project(px, pyy, pz)){
+        if (isVertEdge){
+          ch = CH_VEDGE; ci = baseCi;
+        } else {
+          ch = _vch[v];
+          ci = _vci[v];
+          if (ch === CH_WINDOW && !isWinCol){
+            ch = CH_WALL; ci = baseCi;
+          }
+        }
+        cc = (pcol + 0.5) | 0;
+        rr = (prow + 0.5) | 0;
+        put(cc, rr, pdepth, ch, ci);
+      }
+    }
+  }
+}
+
+/* ============================== 单栋楼 ============================== */
+function drawBuilding(bx,bz,w,d,h,dist){
+  var hw = w*0.5, hd = d*0.5;
+  var baseCi = pickIdx(BUILD_IDX, dist);
+
+  if (cam.x > bx+hw) drawWall(bx+hw, bz-hd, bx+hw, bz+hd, h, dist);
+  if (cam.x < bx-hw) drawWall(bx-hw, bz+hd, bx-hw, bz-hd, h, dist);
+  if (cam.z > bz+hd) drawWall(bx+hw, bz+hd, bx-hw, bz+hd, h, dist);
+  if (cam.z < bz-hd) drawWall(bx-hw, bz-hd, bx+hw, bz-hd, h, dist);
+
+  /* 顶面 */
+  if (cam.y > h){
+    var stepH = dist/focalCols * 0.85; if (stepH < 0.6) stepH = 0.6;
+    var stepV = dist/focalRows * 0.85; if (stepV < 0.6) stepV = 0.6;
+
+    var nX = Math.round(w/stepH); if (nX<1) nX=1; if (nX>28) nX=28;
+    var nZ = Math.round(d/stepV); if (nZ<1) nZ=1; if (nZ>28) nZ=28;
+
+    var a,b,px,pz,cc,rr,ch;
+    for (a=0;a<=nX;a++){
+      px = bx - hw + w*a/nX;
+      for (b=0;b<=nZ;b++){
+        pz = bz - hd + d*b/nZ;
+        if (project(px,h,pz)){
+          ch = (a===0 || a===nX || b===0 || b===nZ) ? CH_HEDGE : CH_ROOF;
+          cc = (pcol+0.5)|0;
+          rr = (prow+0.5)|0;
+          put(cc, rr, pdepth, ch, baseCi);
+        }
+      }
+    }
+  }
+}
+
+/* ============================== 树木 ============================== */
+function drawTree(x, z, h, dist){
+  var ci = pickIdx(TREE_IDX, dist);
+  var stepV = dist/focalRows * 0.85;
+  if (stepV < 0.75) stepV = 0.75;
+
+  var nv = Math.round(h/stepV);
+  if (nv < 1) nv = 1;
+  if (nv > 16) nv = 16;
+
+  var v, py, ch, cc, rr;
+  for (v=0; v<=nv; v++){
+    py = h*v/nv;
+    if (project(x, py, z)){
+      cc = (pcol+0.5)|0;
+      rr = (prow+0.5)|0;
+      ch = (v >= nv*0.55) ? CH_LEAF : CH_TRUNK;
+      put(cc, rr, pdepth, ch, ci);
+    }
+  }
+}
+
+function renderTrees(){
+  var ci0 = Math.round(cam.x/TGRID);
+  var cj0 = Math.round(cam.z/TGRID);
+  var R = Math.ceil(FOG/TGRID);
+  if (R > 20) R = 20;
+  var i,j,tx,tz,dx,dz,dist,th;
+
+  for (i=ci0-R;i<=ci0+R;i++){
+    for (j=cj0-R;j<=cj0+R;j++){
+      if (hash2(i+555, j+777) > 0.24) continue;
+      tx = i*TGRID + (hash2(i+1, j+2)-0.5)*22;
+      tz = j*TGRID + (hash2(i+3, j+4)-0.5)*22;
+      dx = tx-cam.x; dz = tz-cam.z;
+      dist = Math.sqrt(dx*dx+dz*dz);
+      if (dist > FOG) continue;
+      th = 7 + hash2(i+5, j+6)*9;
+      drawTree(tx, tz, th, dist);
+    }
+  }
+}
+
+/* ============================== 城市 ============================== */
+function renderCity(){
+  var ci0 = Math.round(cam.x/BGRID);
+  var cj0 = Math.round(cam.z/BGRID);
+  var R = 7;
+  var i,j,b,dx,dz,dist,halfDiag;
+
+  for (i=ci0-R;i<=ci0+R;i++){
+    for (j=cj0-R;j<=cj0+R;j++){
+      b = getBuilding(i,j);
+      if (!b.ok) continue;
+
+      dx = b.x-cam.x; dz = b.z-cam.z;
+      dist = Math.sqrt(dx*dx+dz*dz);
+
+      halfDiag = 0.5*Math.sqrt(b.w*b.w + b.d*b.d);
+      if (dist - halfDiag > FOG) continue;
+
+      drawBuilding(b.x, b.z, b.w, b.d, b.h, dist);
+    }
+  }
+}
+
+/* ============================== 碰撞 ============================== */
+function collide(){
+  var ci0 = Math.round(cam.x/BGRID);
+  var cj0 = Math.round(cam.z/BGRID);
+  var i,j,b;
+  for (i=ci0-1;i<=ci0+1;i++){
+    for (j=cj0-1;j<=cj0+1;j++){
+      b = getBuilding(i,j);
+      if (!b.ok) continue;
+      if (cam.x > b.x-b.w*0.5 && cam.x < b.x+b.w*0.5 &&
+          cam.z > b.z-b.d*0.5 && cam.z < b.z+b.d*0.5){
+        if (cam.y < b.h + 12) cam.y = b.h + 12;
+      }
+    }
+  }
+}
+
+/* ============================== 绘制缓冲区 ============================== */
+function drawBuffer(){
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,W,H);
+
+  var A = atlas;
+  if (!A) return;
+
+  var r,c,base,ch,src,yy;
+  for (r=0;r<rows;r++){
+    yy = r*cellH;
+    base = r*cols;
+    for (c=0;c<cols;c++){
+      ch = charBuf[base+c];
+      if (ch === 0) continue;
+      src = A.list[colBuf[base+c]];
+      if (!src) continue;
+      ctx.drawImage(src, ch*A.cw, 0, A.cw, A.chh,
+                    c*cellW, yy, A.cw, A.chh);
+    }
+  }
+}
+
+/* ============================== HUD ============================== */
+var hintAlpha = 1.0;
+
+function drawHUD(){
+  ctx.save();
+  ctx.font = Math.round(12*SCALE)+'px ui-monospace,monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = 'rgba(120,255,225,0.85)';
+  var pad = 10*SCALE;
+  var lh  = 15*SCALE;
+  ctx.fillText('ALT  ' + Math.round(cam.y), pad, pad);
+  ctx.fillText('SPD  ' + Math.round(speedNow), pad, pad+lh);
+  ctx.fillText('THR  ' + Math.round(cam.throttle*100) + '%', pad, pad+lh*2);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = 'rgba(120,255,225,0.55)';
+  ctx.fillText('+', W/2, H/2);
+
+  if (hintAlpha > 0.01){
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.font = Math.round(13*SCALE)+'px ui-monospace,monospace';
+    ctx.fillStyle = 'rgba(140,240,255,'+ (hintAlpha*0.75) +')';
+    ctx.fillText('左摇杆：俯仰 / 滚转', W/2, H - 40*SCALE);
+    ctx.fillText('右摇杆：油门 / 方向舵', W/2, H - 22*SCALE);
+  }
+  ctx.restore();
+}
+
+/* ============================== 摇杆 ============================== */
+var stickRadius = 60;
+var sticks = {
+  left:  {active:false,id:-1,ox:0,oy:0,vx:0,vy:0},
+  right: {active:false,id:-1,ox:0,oy:0,vx:0,vy:0}
+};
+
+function drawSticks(){
+  var sides = ['left','right'];
+  for (var k=0;k<2;k++){
+    var s = sticks[sides[k]];
+    if (!s.active) continue;
+
+    var R = stickRadius;
+    ctx.beginPath();
+    ctx.arc(s.ox, s.oy, R, 0, Math.PI*2);
+    ctx.strokeStyle = 'rgba(90,220,255,0.22)';
+    ctx.lineWidth = 2*SCALE;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(s.ox, s.oy, R*0.62, 0, Math.PI*2);
+    ctx.strokeStyle = 'rgba(90,220,255,0.10)';
+    ctx.stroke();
+
+    var kx = s.ox + s.vx*R*0.85;
+    var ky = s.oy + s.vy*R*0.85;
+    ctx.beginPath();
+    ctx.arc(kx, ky, R*0.30, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(110,235,255,0.30)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(150,250,255,0.55)';
+    ctx.lineWidth = 1.5*SCALE;
+    ctx.stroke();
+  }
+}
+
+/* ============================== 输入 ============================== */
+function setStickFromTouch(s, x, y){
+  s.ox = x; s.oy = y;
+  s.vx = 0; s.vy = 0;
+  s.active = true;
+}
+
+function updateStick(s, x, y){
+  var R = stickRadius;
+  var dx = (x - s.ox)/R;
+  var dy = (y - s.oy)/R;
+  var len = Math.sqrt(dx*dx + dy*dy);
+  if (len > 1){ dx/=len; dy/=len; }
+  s.vx = dx; s.vy = dy;
+}
+
+function onDown(x, y, id){
+  hintAlpha = 0;
+  var side = (x*SCALE) < W/2 ? 'left' : 'right';
+  var s = sticks[side];
+  if (s.active) return;
+  s.id = id;
+  setStickFromTouch(s, x*SCALE, y*SCALE);
+}
+
+function onMove(x, y, id){
+  var sides = ['left','right'];
+  for (var k=0;k<2;k++){
+    var s = sticks[sides[k]];
+    if (s.active && s.id === id){
+      updateStick(s, x*SCALE, y*SCALE);
+      return;
+    }
+  }
+}
+
+function onUp(id){
+  var sides = ['left','right'];
+  for (var k=0;k<2;k++){
+    var s = sticks[sides[k]];
+    if (s.active && s.id === id){
+      s.active = false;
+      s.id = -1;
+      s.vx = 0; s.vy = 0;
+    }
+  }
+}
+
+cvs.addEventListener('touchstart', function(e){
+  e.preventDefault();
+  for (var i=0;i<e.changedTouches.length;i++){
+    var t = e.changedTouches[i];
+    onDown(t.clientX, t.clientY, t.identifier);
+  }
+}, {passive:false});
+
+cvs.addEventListener('touchmove', function(e){
+  e.preventDefault();
+  for (var i=0;i<e.changedTouches.length;i++){
+    var t = e.changedTouches[i];
+    onMove(t.clientX, t.clientY, t.identifier);
+  }
+}, {passive:false});
+
+function touchEnd(e){
+  e.preventDefault();
+  for (var i=0;i<e.changedTouches.length;i++){
+    onUp(e.changedTouches[i].identifier);
+  }
+}
+cvs.addEventListener('touchend', touchEnd, {passive:false});
+cvs.addEventListener('touchcancel', touchEnd, {passive:false});
+
+var mouseDown = false;
+cvs.addEventListener('mousedown', function(e){
+  mouseDown = true;
+  onDown(e.clientX, e.clientY, 999);
+});
+cvs.addEventListener('mousemove', function(e){
+  if (mouseDown) onMove(e.clientX, e.clientY, 999);
+});
+window.addEventListener('mouseup', function(){
+  mouseDown = false;
+  onUp(999);
+});
+
+var keys = {};
+window.addEventListener('keydown', function(e){ keys[e.key]=true; });
+window.addEventListener('keyup',   function(e){ keys[e.key]=false; });
+
+/* ============================== 物理 ============================== */
+function update(dt){
+  var L = sticks.left;
+  var Rg = sticks.right;
+
+  var rollIn = 0, pitchIn = 0, yawIn = 0;
+
+  if (L.active){ rollIn = L.vx; pitchIn = -L.vy; }
+  if (Rg.active){
+    yawIn = Rg.vx;
+    cam.throttle = clamp(0.5 - Rg.vy*0.5, 0, 1);
+  }
+
+  if (keys['a']||keys['ArrowLeft'])  rollIn -= 1;
+  if (keys['d']||keys['ArrowRight']) rollIn += 1;
+  if (keys['w']||keys['ArrowUp'])    pitchIn += 1;
+  if (keys['s']||keys['ArrowDown'])  pitchIn -= 1;
+  if (keys['q']) yawIn -= 1;
+  if (keys['e']) yawIn += 1;
+  if (keys['Shift']) cam.throttle = clamp(cam.throttle + dt*0.8, 0, 1);
+  if (keys['Control']) cam.throttle = clamp(cam.throttle - dt*0.8, 0, 1);
+
+  var targetRoll = rollIn * 0.88;
+  var k = 6*dt; if (k > 1) k = 1;
+  cam.roll += (targetRoll - cam.roll) * k;
+
+  cam.pitch += pitchIn * 1.5 * dt;
+  if (cam.pitch >  1.15) cam.pitch =  1.15;
+  if (cam.pitch < -1.15) cam.pitch = -1.15;
+
+  cam.yaw += Math.sin(cam.roll) * 1.35 * dt;
+  cam.yaw += yawIn * 0.85 * dt;
+
+  speedNow = 18 + cam.throttle * 102;
+
+  updateBasis();
+
+  cam.x += FX * speedNow * dt;
+  cam.y += FY * speedNow * dt;
+  cam.z += FZ * speedNow * dt;
+
+  if (cam.y < 8){
+    cam.y = 8;
+    if (cam.pitch < 0) cam.pitch *= 0.4;
+  }
+  if (cam.y > 900) cam.y = 900;
+
+  collide();
+
+  if (hintAlpha > 0) hintAlpha -= dt*0.35;
+}
+
+/* ============================== 渲染一帧 ============================== */
+function render(){
+  depthBuf.fill(1e9);
+  charBuf.fill(0);
+  colBuf.fill(0);
+
+  renderGround();
+  renderTrees();
+  renderCity();
+
+  drawBuffer();
+  drawHUD();
+  drawSticks();
+}
+
+/* ============================== 主循环 ============================== */
+var lastT = 0;
+var running = false;
+
+function loop(now){
+  if (!running) return;
+  var dt = (now - lastT)/1000;
+  lastT = now;
+  if (!(dt > 0) || dt > 0.06) dt = 0.016;
+
+  update(dt);
+  render();
+
+  requestAnimationFrame(loop);
+}
+
+/* ============================== 启动 ============================== */
+function boot(){
+  resize();
+  stickRadius = Math.min(window.innerWidth, window.innerHeight) * 0.16 * SCALE;
+  if (stickRadius < 40*SCALE) stickRadius = 40*SCALE;
+
+  cam.x = 0; cam.z = 0;
+  cam.y = 190;
+  cam.yaw = 0.4;
+  cam.pitch = -0.05;
+  cam.roll = 0;
+  cam.throttle = 0.5;
+
+  running = true;
+  lastT = performance.now();
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener('resize', function(){
+  resize();
+  stickRadius = Math.min(window.innerWidth, window.innerHeight) * 0.16 * SCALE;
+  if (stickRadius < 40*SCALE) stickRadius = 40*SCALE;
+});
+
+window.addEventListener('orientationchange', function(){
+  setTimeout(function(){
+    resize();
+    stickRadius = Math.min(window.innerWidth, window.innerHeight) * 0.16 * SCALE;
+    if (stickRadius < 40*SCALE) stickRadius = 40*SCALE;
+  }, 300);
+});
+
+boot();
+
+})();
+</script>
+</body>
+</html>
